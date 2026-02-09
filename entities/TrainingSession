@@ -1,0 +1,40 @@
+{
+  "name": "TrainingSession",
+  "type": "object",
+  "properties": {
+    "duration_seconds": {
+      "type": "number",
+      "description": "Total training duration in seconds"
+    },
+    "program_type": {
+      "type": "string",
+      "enum": [
+        "beginner",
+        "intermediate",
+        "advanced",
+        "free_practice"
+      ],
+      "description": "Type of training program"
+    },
+    "avg_pressure_score": {
+      "type": "number",
+      "description": "Average pressure consistency score 0-100"
+    },
+    "circular_breaths_count": {
+      "type": "number",
+      "description": "Number of successful circular breaths"
+    },
+    "longest_sustained_seconds": {
+      "type": "number",
+      "description": "Longest sustained breath in seconds"
+    },
+    "notes": {
+      "type": "string",
+      "description": "User notes about the session"
+    }
+  },
+  "required": [
+    "duration_seconds",
+    "program_type"
+  ]
+}
