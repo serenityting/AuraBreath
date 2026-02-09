@@ -1,152 +1,323 @@
-import React from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Button } from '@/components/ui/button';
+import { Card } from '@/components/ui/card';
+import { Play, Square, Save, History, Settings } from 'lucide-react';
+import { motion, AnimatePresence } from 'framer-motion';
+import { base44 } from '@/api/base44Client';
 import { Link } from 'react-router-dom';
-import { motion } from 'framer-motion';
-import { Play, BarChart3, BookOpen, Moon, Wind, Heart } from 'lucide-react';
-import { Button } from "@/components/ui/button";
 import { createPageUrl } from '@/utils';
+import { toast } from 'sonner';
+
+import PressureGauge from '@/components/breathing/PressureGauge';
+import BreathingVisualizer from '@/components/breathing/BreathingVisualizer';
+import SessionStats from '@/components/breathing/SessionStats';
+import ArduinoConnection from '@/components/breathing/ArduinoConnection';
 
 export default function Home() {
-  const features = [
-    {
-      icon: Wind,
-      title: 'Circular Breathing',
-      description: 'Learn the traditional didgeridoo technique used for centuries'
-    },
-    {
-      icon: Moon,
-      title: 'Sleep Apnea Relief',
-      description: 'Strengthen throat muscles to reduce sleep apnea symptoms'
-    },
-    {
-      icon: Heart,
-      title: 'Health Benefits',
-      description: 'Improve respiratory health and reduce snoring naturally'
+  const [isConnected, setIsConnected] = useState(false);
+  const [isSessionActive, setIsSessionActive] = useState(false);
+  const [pressure, setPressure] = useState(0);
+  const [showConnection, setShowConnection] = useState(false);
+  
+  // Session data
+  const [sessionDuration, setSessionDuration] = useState(0);
+  const [pressureHistory, setPressureHistory] = useState([]);
+  const [circularBreaths, setCircularBreaths] = useState(0);
+  
+  const wsRef = useRef(null);
+  const serialRef = useRef(null);
+  const timerRef = useRef(null);
+  const lastPressureRef = useRef(0);
+
+  // Detect circular breath pattern
+  useEffect(() => {
+    if (isSessionActive && pressureHistory.length > 10) {
+      const recent = pressureHistory.slice(-10);
+      const hadDip = recent.some((p, i) => i > 0 && recent[i-1] > 30 && p < 20);
+      const recovered = recent[recent.length - 1] > 30;
+      
+      if (hadDip && recovered && lastPressureRef.current < 20) {
+        setCircularBreaths(prev => prev + 1);
+      }
+      lastPressureRef.current = recent[recent.length - 1];
     }
-  ];
+  }, [pressureHistory, isSessionActive]);
+
+  // Session timer
+  useEffect(() => {
+    if (isSessionActive) {
+      timerRef.current = setInterval(() => {
+        setSessionDuration(prev => prev + 1);
+      }, 1000);
+    } else {
+      clearInterval(timerRef.current);
+    }
+    return () => clearInterval(timerRef.current);
+  }, [isSessionActive]);
+
+  const handleConnect = useCallback(async ({ type, url, port }) => {
+    if (type === 'websocket') {
+      try {
+        const ws = new WebSocket(url);
+        ws.onopen = () => {
+          setIsConnected(true);
+          toast.success('Connected to Arduino');
+        };
+        ws.onmessage = (event) => {
+          const value = parseFloat(event.data);
+          if (!isNaN(value)) {
+            setPressure(value);
+            if (isSessionActive) {
+              setPressureHistory(prev => [...prev, value]);
+            }
+          }
+        };
+        ws.onerror = () => {
+          toast.error('Connection failed');
+          setIsConnected(false);
+        };
+        ws.onclose = () => {
+          setIsConnected(false);
+        };
+        wsRef.current = ws;
+      } catch (err) {
+        toast.error('Failed to connect');
+      }
+    } else if (type === 'serial') {
+      // Web Serial API
+      if ('serial' in navigator) {
+        try {
+          const port = await navigator.serial.requestPort();
+          await port.open({ baudRate: 9600 });
+          serialRef.current = port;
+          setIsConnected(true);
+          toast.success('Connected via Serial');
+          
+          const reader = port.readable.getReader();
+          const decoder = new TextDecoder();
+          
+          const readLoop = async () => {
+            while (true) {
+              const { value, done } = await reader.read();
+              if (done) break;
+              const text = decoder.decode(value);
+              const num = parseFloat(text.trim());
+              if (!isNaN(num)) {
+                setPressure(num);
+                if (isSessionActive) {
+                  setPressureHistory(prev => [...prev, num]);
+                }
+              }
+            }
+          };
+          readLoop();
+        } catch (err) {
+          toast.error('Serial connection failed');
+        }
+      } else {
+        toast.error('Web Serial not supported in this browser');
+      }
+    }
+    setShowConnection(false);
+  }, [isSessionActive]);
+
+  const handleDisconnect = () => {
+    if (wsRef.current) {
+      wsRef.current.close();
+      wsRef.current = null;
+    }
+    if (serialRef.current) {
+      serialRef.current.close();
+      serialRef.current = null;
+    }
+    setIsConnected(false);
+    setPressure(0);
+  };
+
+  const startSession = () => {
+    setIsSessionActive(true);
+    setSessionDuration(0);
+    setPressureHistory([]);
+    setCircularBreaths(0);
+  };
+
+  const stopSession = async () => {
+    setIsSessionActive(false);
+    
+    if (sessionDuration > 5) {
+      const avgPressure = pressureHistory.length > 0 
+        ? pressureHistory.reduce((a, b) => a + b, 0) / pressureHistory.length 
+        : 0;
+      
+      const maxPressure = pressureHistory.length > 0 
+        ? Math.max(...pressureHistory) 
+        : 0;
+      
+      // Calculate consistency (lower variance = higher score)
+      const variance = pressureHistory.length > 0
+        ? pressureHistory.reduce((sum, p) => sum + Math.pow(p - avgPressure, 2), 0) / pressureHistory.length
+        : 0;
+      const consistencyScore = Math.max(0, Math.min(100, 100 - Math.sqrt(variance)));
+
+      await base44.entities.BreathingSession.create({
+        duration_seconds: sessionDuration,
+        avg_pressure: avgPressure,
+        max_pressure: maxPressure,
+        circular_breaths_count: circularBreaths,
+        consistency_score: Math.round(consistencyScore)
+      });
+      
+      toast.success('Session saved!');
+    }
+  };
+
+  const avgPressure = pressureHistory.length > 0 
+    ? pressureHistory.reduce((a, b) => a + b, 0) / pressureHistory.length 
+    : 0;
+  
+  const consistencyScore = pressureHistory.length > 10
+    ? Math.max(0, Math.min(100, 100 - Math.sqrt(
+        pressureHistory.reduce((sum, p) => sum + Math.pow(p - avgPressure, 2), 0) / pressureHistory.length
+      )))
+    : 0;
+
+  // Demo mode - simulate pressure when not connected
+  useEffect(() => {
+    if (!isConnected && isSessionActive) {
+      const interval = setInterval(() => {
+        const simulated = 40 + Math.sin(Date.now() / 1000) * 30 + Math.random() * 10;
+        setPressure(simulated);
+        setPressureHistory(prev => [...prev, simulated]);
+      }, 100);
+      return () => clearInterval(interval);
+    }
+  }, [isConnected, isSessionActive]);
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-stone-50 via-amber-50/30 to-stone-100">
-      {/* Hero Section */}
-      <div className="relative overflow-hidden">
-        {/* Background pattern */}
-        <div className="absolute inset-0 opacity-5">
-          <svg className="w-full h-full" viewBox="0 0 100 100" preserveAspectRatio="none">
-            <pattern id="waves" x="0" y="0" width="20" height="20" patternUnits="userSpaceOnUse">
-              <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeWidth="0.5" />
-            </pattern>
-            <rect fill="url(#waves)" width="100" height="100" />
-          </svg>
-        </div>
-
-        <div className="max-w-4xl mx-auto px-4 pt-16 pb-24 md:pt-24 md:pb-32 relative">
-          <motion.div
-            initial={{ opacity: 0, y: 30 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.8 }}
-            className="text-center"
-          >
-            {/* Logo/Icon */}
-            <motion.div
-              className="w-24 h-24 md:w-32 md:h-32 mx-auto mb-8 rounded-full bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center shadow-xl shadow-amber-200"
-              animate={{ 
-                scale: [1, 1.05, 1],
-                boxShadow: [
-                  '0 25px 50px -12px rgba(217, 119, 6, 0.25)',
-                  '0 25px 50px -12px rgba(217, 119, 6, 0.4)',
-                  '0 25px 50px -12px rgba(217, 119, 6, 0.25)'
-                ]
-              }}
-              transition={{ duration: 3, repeat: Infinity }}
-            >
-              <Wind className="w-12 h-12 md:w-16 md:h-16 text-white" />
-            </motion.div>
-
-            <h1 className="text-4xl md:text-6xl font-light text-stone-800 mb-4 tracking-tight">
-              Breathe
-              <span className="font-normal text-amber-600"> Better</span>
+    <div className="min-h-screen bg-gradient-to-br from-slate-900 via-slate-800 to-slate-900 p-4 md:p-8">
+      <div className="max-w-6xl mx-auto">
+        {/* Header */}
+        <div className="flex items-center justify-between mb-8">
+          <div>
+            <h1 className="text-3xl md:text-4xl font-bold bg-gradient-to-r from-cyan-400 to-blue-400 bg-clip-text text-transparent">
+              AuraBreath
             </h1>
-            
-            <p className="text-lg md:text-xl text-stone-500 mb-8 max-w-xl mx-auto leading-relaxed">
-              Master circular breathing with didgeridoo training to naturally reduce sleep apnea and improve your sleep quality.
-            </p>
-
-            <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
-              <Link to={createPageUrl('Train')}>
-                <Button 
-                  size="lg" 
-                  className="rounded-full px-8 py-6 text-lg bg-gradient-to-r from-amber-500 to-amber-600 hover:from-amber-600 hover:to-amber-700 shadow-lg shadow-amber-200 transition-all hover:shadow-xl hover:shadow-amber-300"
-                >
-                  <Play className="w-5 h-5 mr-2" />
-                  Start Training
-                </Button>
-              </Link>
-              
-              <Link to={createPageUrl('Progress')}>
-                <Button 
-                  variant="outline" 
-                  size="lg" 
-                  className="rounded-full px-8 py-6 text-lg border-2 border-stone-300 hover:border-amber-400 hover:bg-amber-50"
-                >
-                  <BarChart3 className="w-5 h-5 mr-2" />
-                  View Progress
-                </Button>
-              </Link>
-            </div>
-          </motion.div>
-        </div>
-      </div>
-
-      {/* Features Section */}
-      <div className="max-w-4xl mx-auto px-4 pb-16">
-        <div className="grid md:grid-cols-3 gap-6">
-          {features.map((feature, index) => {
-            const Icon = feature.icon;
-            return (
-              <motion.div
-                key={feature.title}
-                initial={{ opacity: 0, y: 20 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: 0.2 + index * 0.1 }}
-                className="bg-white rounded-3xl p-6 shadow-sm hover:shadow-md transition-shadow"
-              >
-                <div className="w-12 h-12 rounded-2xl bg-amber-100 flex items-center justify-center mb-4">
-                  <Icon className="w-6 h-6 text-amber-600" />
-                </div>
-                <h3 className="text-lg font-semibold text-stone-800 mb-2">
-                  {feature.title}
-                </h3>
-                <p className="text-stone-500 text-sm leading-relaxed">
-                  {feature.description}
-                </p>
-              </motion.div>
-            );
-          })}
-        </div>
-
-        {/* Info Card */}
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ delay: 0.5 }}
-          className="mt-12 bg-gradient-to-r from-stone-800 to-stone-900 rounded-3xl p-8 text-white"
-        >
-          <div className="flex flex-col md:flex-row items-start gap-6">
-            <div className="w-14 h-14 rounded-2xl bg-white/10 flex items-center justify-center flex-shrink-0">
-              <BookOpen className="w-7 h-7" />
-            </div>
-            <div>
-              <h3 className="text-xl font-semibold mb-2">
-                How It Works
-              </h3>
-              <p className="text-stone-300 leading-relaxed mb-4">
-                Circular breathing is a technique where you inhale through your nose while simultaneously exhaling through your mouth. This trains the muscles in your upper airway, which studies have shown can significantly reduce sleep apnea severity and snoring.
-              </p>
-              <p className="text-stone-400 text-sm">
-                Use your phone's microphone as a pressure sensor to get real-time feedback on your breathing technique — no didgeridoo required (though one helps!).
-              </p>
-            </div>
+            <p className="text-slate-400 mt-1">Circular Breathing Trainer</p>
           </div>
-        </motion.div>
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              size="icon"
+              className="border-slate-600 text-slate-300 hover:bg-slate-700"
+              onClick={() => setShowConnection(!showConnection)}
+            >
+              <Settings className="w-5 h-5" />
+            </Button>
+            <Link to={createPageUrl('History')}>
+              <Button
+                variant="outline"
+                size="icon"
+                className="border-slate-600 text-slate-300 hover:bg-slate-700"
+              >
+                <History className="w-5 h-5" />
+              </Button>
+            </Link>
+          </div>
+        </div>
+
+        {/* Connection Panel */}
+        <AnimatePresence>
+          {showConnection && (
+            <motion.div
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
+              className="mb-6 overflow-hidden"
+            >
+              <ArduinoConnection
+                isConnected={isConnected}
+                onConnect={handleConnect}
+                onDisconnect={handleDisconnect}
+              />
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Main Training Area */}
+        <div className="grid md:grid-cols-2 gap-8 mb-8">
+          {/* Pressure Gauge */}
+          <Card className="bg-slate-800/30 border-slate-700 p-8 flex flex-col items-center justify-center">
+            <PressureGauge 
+              pressure={pressure} 
+              maxPressure={100} 
+              isConnected={isConnected || isSessionActive}
+            />
+            <div className="mt-6 text-center">
+              <p className="text-slate-300 text-sm">
+                {pressure < 30 ? 'Blow harder into the didgeridoo' : 
+                 pressure < 70 ? 'Great pressure - maintain it!' : 
+                 'Strong breath - try circular breathing now!'}
+              </p>
+            </div>
+          </Card>
+
+          {/* Breathing Visualizer */}
+          <Card className="bg-slate-800/30 border-slate-700 p-8 flex flex-col items-center justify-center">
+            <BreathingVisualizer pressure={pressure} isActive={isSessionActive} />
+            <p className="text-slate-400 text-sm mt-4">
+              {isSessionActive ? 'Breathe in through your nose while maintaining airflow' : 'Start session to begin training'}
+            </p>
+          </Card>
+        </div>
+
+        {/* Session Stats */}
+        <div className="mb-8">
+          <SessionStats
+            duration={sessionDuration}
+            avgPressure={avgPressure}
+            circularBreaths={circularBreaths}
+            consistencyScore={Math.round(consistencyScore)}
+          />
+        </div>
+
+        {/* Control Buttons */}
+        <div className="flex justify-center gap-4">
+          {!isSessionActive ? (
+            <Button
+              size="lg"
+              onClick={startSession}
+              className="bg-gradient-to-r from-cyan-500 to-blue-500 hover:from-cyan-600 hover:to-blue-600 text-lg px-8 py-6"
+            >
+              <Play className="w-6 h-6 mr-2" />
+              Start Session
+            </Button>
+          ) : (
+            <Button
+              size="lg"
+              onClick={stopSession}
+              variant="outline"
+              className="border-red-500 text-red-400 hover:bg-red-500/20 text-lg px-8 py-6"
+            >
+              <Square className="w-6 h-6 mr-2" />
+              End Session
+            </Button>
+          )}
+        </div>
+
+        {/* Instructions */}
+        <Card className="bg-slate-800/30 border-slate-700 p-6 mt-8">
+          <h3 className="text-white font-semibold mb-3">How to Practice Circular Breathing</h3>
+          <ol className="text-slate-300 text-sm space-y-2 list-decimal list-inside">
+            <li>Connect your Arduino pressure sensor to the didgeridoo</li>
+            <li>Start blowing to create a steady drone sound</li>
+            <li>Store air in your cheeks while inhaling through your nose</li>
+            <li>Push the stored air out with your cheeks while breathing in</li>
+            <li>Practice until you can maintain continuous airflow</li>
+          </ol>
+          <p className="text-cyan-400 text-sm mt-4">
+            Regular practice can help strengthen throat muscles and reduce sleep apnea symptoms.
+          </p>
+        </Card>
       </div>
     </div>
   );
